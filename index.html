@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>제품 사진 특징 분석</title>
+  <script src="https://cdn.tailwindcss.com/3.4.16"></script>
+</head>
+<body class="bg-slate-50 text-slate-800">
+  <main class="mx-auto max-w-3xl px-4 py-8 space-y-6">
+    <header>
+      <h1 class="text-2xl font-bold">제품 사진 특징 분석</h1>
+      <p class="text-sm text-slate-500 mt-1">사진을 올리면 AI가 색상·형태·소재와 마케팅 포인트를 정리해 줍니다.</p>
+    </header>
+
+    <!-- 1. 사진 업로드 -->
+    <section class="bg-white rounded-xl shadow-sm p-5 space-y-3">
+      <h2 class="font-semibold">1. 제품 사진 올리기</h2>
+      <label id="drop" for="file" class="flex flex-col items-center justify-center border-2 border-dashed border-slate-300 rounded-lg p-6 cursor-pointer hover:bg-slate-50 text-center">
+        <img id="preview" class="hidden max-h-64 rounded mb-3" alt="미리보기" />
+        <span id="dropText" class="text-slate-500">클릭하거나 사진을 끌어다 놓으세요 (JPG·PNG·WEBP, 5MB 이하)</span>
+        <input id="file" type="file" accept="image/jpeg,image/png,image/webp" class="hidden" />
+      </label>
+      <p class="text-xs text-amber-700 bg-amber-50 rounded p-2">⚠ 사진은 외부 AI 서비스(OpenRouter 무료 모델)로 전송됩니다. 사람 얼굴이나 공개되면 안 되는 제품 사진은 올리지 마세요.</p>
+      <button id="analyzeBtn" disabled class="w-full rounded-lg bg-indigo-600 text-white py-2 font-medium disabled:bg-slate-300">특징 인식하기</button>
+      <p id="analyzeMsg" class="text-sm" role="status"></p>
+    </section>
+
+    <!-- 2. 분석 결과 -->
+    <section id="featSec" class="hidden bg-white rounded-xl shadow-sm p-5 space-y-3">
+      <div class="flex items-center justify-between">
+        <h2 class="font-semibold">2. 분석 결과 (고쳐도 됩니다)</h2>
+        <button id="copyAllBtn" class="text-xs rounded border border-slate-300 px-2 py-1 hover:bg-slate-100">전체 복사</button>
+      </div>
+      <p class="text-xs text-slate-500">기본 스펙은 사진에서 보이는 사실이고, 아래 마케팅 해석은 AI의 추정이니 꼭 확인하고 고쳐 주세요.</p>
+      <h3 class="text-sm font-semibold text-indigo-600">기본 스펙</h3>
+      <div id="specGrid" class="grid grid-cols-1 sm:grid-cols-2 gap-3"></div>
+      <h3 class="text-sm font-semibold text-indigo-600 pt-1">마케팅 해석 (추정)</h3>
+      <div id="mktGrid" class="grid grid-cols-1 gap-3"></div>
+    </section>
+  </main>
+
+<script>
+  // 공개해도 되는 값만 둔다. OPEN_API_KEY 같은 비밀 키는 Edge Function(서버)에만 있다.
+  const SUPABASE_URL = "https://xyawtkqsmdeslslndnto.supabase.co";
+  // 함수를 --no-verify-jwt로 배포했다면 비워 둬도 된다. JWT 검증을 켰다면 anon(publishable) 키를 넣는다.
+  const SUPABASE_ANON_KEY = "";
+
+  const BASE = `${SUPABASE_URL}/functions/v1`;
+  const MAX_BYTES = 5 * 1024 * 1024;
+  const TYPES = ["image/jpeg", "image/png", "image/webp"];
+  const $ = (id) => document.getElementById(id);
+  let imageData = ""; // 줄인 사진(base64 data URL)
+
+  // 분석 항목: [키, 이름, 줄 수]
+  const SPEC = [["color", "색상", 1], ["shape", "형태", 1], ["material", "소재", 1], ["category", "카테고리(제품 종류)", 1]];
+  const MKT = [["context", "사용 맥락 및 배경", 2], ["mood", "분위기 및 감성", 2], ["target", "예상 타겟 고객", 2], ["points", "핵심 소구점", 2]];
+  const ITEMS = [...SPEC, ...MKT];
+
+  function buildFields(boxId, items) {
+    $(boxId).innerHTML = items.map(([k, label, rows]) =>
+      `<label class="text-sm">${label}<textarea id="f_${k}" rows="${rows}" class="mt-1 w-full rounded border border-slate-300 px-3 py-2"></textarea></label>`).join("");
+  }
+  buildFields("specGrid", SPEC);
+  buildFields("mktGrid", MKT);
+
+  function setMsg(text, kind) {
+    const el = $("analyzeMsg");
+    el.textContent = text;
+    el.className = "text-sm " + (kind === "error" ? "text-red-600" : kind === "ok" ? "text-green-700" : "text-slate-500");
+  }
+
+  // 긴 변 1024px로 줄여 JPEG으로 변환 (전송량·토큰 절약)
+  function resize(file) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      const url = URL.createObjectURL(file);
+      img.onload = () => {
+        const s = Math.min(1, 1024 / Math.max(img.width, img.height));
+        const c = document.createElement("canvas");
+        c.width = Math.round(img.width * s);
+        c.height = Math.round(img.height * s);
+        const ctx = c.getContext("2d");
+        ctx.fillStyle = "#fff"; // 투명 PNG 배경을 흰색으로
+        ctx.fillRect(0, 0, c.width, c.height);
+        ctx.drawImage(img, 0, 0, c.width, c.height);
+        URL.revokeObjectURL(url);
+        resolve(c.toDataURL("image/jpeg", 0.85));
+      };
+      img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("사진을 읽을 수 없습니다.")); };
+      img.src = url;
+    });
+  }
+
+  async function handleFile(file) {
+    setMsg("");
+    if (!file) return;
+    if (!TYPES.includes(file.type)) return setMsg("JPG, PNG, WEBP 사진만 올릴 수 있습니다.", "error");
+    if (file.size > MAX_BYTES) return setMsg("사진이 너무 큽니다. 5MB 이하로 올려 주세요.", "error");
+    try {
+      imageData = await resize(file);
+    } catch (e) {
+      return setMsg(e.message, "error");
+    }
+    $("preview").src = imageData;
+    $("preview").classList.remove("hidden");
+    $("dropText").textContent = "다른 사진으로 바꾸려면 다시 선택하세요";
+    $("analyzeBtn").disabled = false;
+    $("featSec").classList.add("hidden");
+  }
+
+  $("file").addEventListener("change", (e) => handleFile(e.target.files[0]));
+  $("drop").addEventListener("dragover", (e) => e.preventDefault());
+  $("drop").addEventListener("drop", (e) => { e.preventDefault(); handleFile(e.dataTransfer.files[0]); });
+
+  async function callFn(name, body) {
+    const headers = { "Content-Type": "application/json" };
+    if (SUPABASE_ANON_KEY) headers.Authorization = `Bearer ${SUPABASE_ANON_KEY}`;
+    const res = await fetch(`${BASE}/${name}`, { method: "POST", headers, body: JSON.stringify(body) });
+    let data = {};
+    try { data = await res.json(); } catch { /* 본문 없음 */ }
+    if (!res.ok) throw new Error(data.error || `요청에 실패했습니다 (오류 ${res.status}).`);
+    return data;
+  }
+
+  $("analyzeBtn").addEventListener("click", async () => {
+    const btn = $("analyzeBtn");
+    btn.disabled = true; btn.textContent = "인식 중...";
+    setMsg("사진을 분석하고 있습니다. 최대 30초쯤 걸릴 수 있어요.");
+    try {
+      const f = await callFn("analyze-image", { image: imageData });
+      for (const [k] of ITEMS) $("f_" + k).value = f[k] || "";
+      $("featSec").classList.remove("hidden");
+      setMsg("인식 완료! 아래 특징을 확인하고 필요하면 고쳐 주세요.", "ok");
+    } catch (e) {
+      setMsg("❌ " + e.message, "error");
+    } finally {
+      btn.disabled = false; btn.textContent = "특징 인식하기";
+    }
+  });
+
+  $("copyAllBtn").addEventListener("click", async (ev) => {
+    const text = ITEMS.map(([k, label]) => `${label}: ${$("f_" + k).value.trim()}`).join("\n");
+    try { await navigator.clipboard.writeText(text); ev.target.textContent = "복사됨 ✓"; }
+    catch { ev.target.textContent = "복사 실패"; }
+    setTimeout(() => (ev.target.textContent = "전체 복사"), 1500);
+  });
+</script>
+</body>
+</html>
